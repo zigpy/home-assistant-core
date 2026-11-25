@@ -11,6 +11,7 @@ from probatio import to_field_list
 import pytest
 from pytest_homeassistant.common import MockConfigEntry, async_fire_time_changed
 from zha.application.const import ATTR_TYPE, ZHA_GW_MSG
+from zha.zigbee.device import DeviceFirmwareInfoUpdatedEvent
 from zigpy.application import ControllerApplication
 import zigpy.device
 from zigpy.profiles import zha
@@ -55,6 +56,77 @@ from .conftest import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+
+@pytest.mark.usefixtures("zigpy_app_controller_with_switches")
+async def test_device_events_unsubscribed_on_unload(
+    hass: HomeAssistant,
+    setup_zha: Callable[..., Coroutine[Any, Any, None]],
+    config_entry: MockConfigEntry,
+    device_registry: dr.DeviceRegistry,
+) -> None:
+    """Test retained ZHA devices cannot update HA after the entry is unloaded."""
+    await setup_zha()
+    gateway_proxy = get_zha_gateway_proxy(hass)
+    device_proxy = gateway_proxy.get_device_proxy(
+        zigpy.types.EUI64.convert("01:2d:6f:00:0a:90:69:e1")
+    )
+    assert device_proxy is not None
+    device = device_proxy.device
+    device_id = device_proxy.device_id
+    event = DeviceFirmwareInfoUpdatedEvent(
+        old_firmware_version=None, new_firmware_version="test-before-unload"
+    )
+    device.emit(event.event_type, event)
+    await hass.async_block_till_done()
+    assert device_registry.async_get(device_id).sw_version == "test-before-unload"
+
+    assert await hass.config_entries.async_unload(config_entry.entry_id)
+    event = DeviceFirmwareInfoUpdatedEvent(
+        old_firmware_version="test-before-unload",
+        new_firmware_version="test-after-unload",
+    )
+    device.emit(event.event_type, event)
+    await hass.async_block_till_done()
+    assert device_registry.async_get(device_id).sw_version == "test-before-unload"
+
+
+@pytest.mark.usefixtures("zigpy_app_controller_with_switches")
+async def test_device_events_unsubscribed_on_removal(
+    hass: HomeAssistant,
+    setup_zha: Callable[..., Coroutine[Any, Any, None]],
+    device_registry: dr.DeviceRegistry,
+) -> None:
+    """Test retained ZHA devices cannot update HA after device removal."""
+    await setup_zha()
+    gateway_proxy = get_zha_gateway_proxy(hass)
+    device_proxy = gateway_proxy.get_device_proxy(
+        zigpy.types.EUI64.convert("01:2d:6f:00:0a:90:69:e1")
+    )
+    assert device_proxy is not None
+    device = device_proxy.device
+    device_id = device_proxy.device_id
+    event = DeviceFirmwareInfoUpdatedEvent(
+        old_firmware_version=None, new_firmware_version="test-before-removal"
+    )
+    device.emit(event.event_type, event)
+    await hass.async_block_till_done()
+    assert device_registry.async_get(device_id).sw_version == "test-before-removal"
+
+    gateway_proxy.gateway.device_removed(device.device)
+    await hass.async_block_till_done()
+    assert gateway_proxy.get_device_proxy(device.ieee) is None
+    assert device_registry.async_get(device_id) is None
+
+    with patch.object(device_registry, "async_update_device") as update_device:
+        event = DeviceFirmwareInfoUpdatedEvent(
+            old_firmware_version="test-before-removal",
+            new_firmware_version="test-after-removal",
+        )
+        device.emit(event.event_type, event)
+        await hass.async_block_till_done()
+
+    update_device.assert_not_called()
 
 
 async def test_zcl_schema_conversions(hass: HomeAssistant) -> None:
@@ -1004,7 +1076,7 @@ async def test_zha_group_entity_name_migrated_only_once(
 
 def _add_light_members(
     app_controller: ControllerApplication,
-    zigpy_device_mock: Callable[..., zigpy.device.Device],
+    zigpy_device_mock: Callable[..., zigpy.device.ZigbeeDevice],
 ) -> None:
     """Add two lights to the group, so it also gets a light group entity."""
     group = app_controller.groups[FIXTURE_GRP_WITH_ENTITIES_ID]
@@ -1040,7 +1112,7 @@ async def test_zha_group_entity_areas_migrated_with_several_entities(
     hass: HomeAssistant,
     setup_zha: Callable[..., Coroutine[Any, Any, None]],
     zigpy_app_controller_with_group: ControllerApplication,
-    zigpy_device_mock: Callable[..., zigpy.device.Device],
+    zigpy_device_mock: Callable[..., zigpy.device.ZigbeeDevice],
     config_entry: MockConfigEntry,
     area_registry: ar.AreaRegistry,
     device_registry: dr.DeviceRegistry,
@@ -1109,7 +1181,7 @@ async def test_zha_group_entity_name_not_migrated_with_several_entities(
     hass: HomeAssistant,
     setup_zha: Callable[..., Coroutine[Any, Any, None]],
     zigpy_app_controller_with_group: ControllerApplication,
-    zigpy_device_mock: Callable[..., zigpy.device.Device],
+    zigpy_device_mock: Callable[..., zigpy.device.ZigbeeDevice],
     config_entry: MockConfigEntry,
     device_registry: dr.DeviceRegistry,
     entity_registry: er.EntityRegistry,
@@ -1251,7 +1323,7 @@ async def test_zha_group_cleanup_leaves_other_integrations_alone(
     hass: HomeAssistant,
     setup_zha: Callable[..., Coroutine[Any, Any, None]],
     zigpy_app_controller_with_group: ControllerApplication,
-    zigpy_device_mock: Callable[..., zigpy.device.Device],
+    zigpy_device_mock: Callable[..., zigpy.device.ZigbeeDevice],
     entity_registry: er.EntityRegistry,
 ) -> None:
     """Test the group cleanup only removes ZHA's own group entities.

@@ -19,6 +19,8 @@ import probatio
 from zha.application import Platform as ZhaPlatform
 from zha.application.const import (
     ATTR_DEVICE_IEEE,
+    ATTR_MANUFACTURER,
+    ATTR_MODEL,
     ATTR_TYPE,
     ATTR_UNIQUE_ID,
     CLUSTER_TYPE_IN,
@@ -68,14 +70,15 @@ from zha.event import EventBase
 from zha.exceptions import ZHAException
 from zha.mixins import LogMixin
 from zha.zigbee.device import (
+    BaseDevice,
     ClusterBindEvent,
     ClusterConfigureReportingEvent,
-    Device,
     DeviceConfiguredEvent,
     DeviceEntityAddedEvent,
     DeviceEntityRemovedEvent,
     DeviceFirmwareInfoUpdatedEvent,
     ZHAEvent,
+    ZigbeeDevice,
 )
 from zha.zigbee.group import Group, GroupInfo, GroupMember
 import zhaquirks
@@ -106,8 +109,6 @@ from homeassistant.const import (
     ATTR_AREA_ID,
     ATTR_DEVICE_ID,
     ATTR_ENTITY_ID,
-    ATTR_MANUFACTURER,
-    ATTR_MODEL,
     ATTR_NAME,
     Platform,
 )
@@ -447,7 +448,7 @@ class ZHADeviceProxy(EventBase):
 
     _ha_device_id: str
 
-    def __init__(self, device: Device, gateway_proxy: ZHAGatewayProxy) -> None:
+    def __init__(self, device: BaseDevice, gateway_proxy: ZHAGatewayProxy) -> None:
         """Initialize the gateway proxy."""
         super().__init__()
         self.device = device
@@ -456,13 +457,16 @@ class ZHADeviceProxy(EventBase):
         self._unsubs.append(self.device.on_all_events(self._handle_event_protocol))
 
     @callback
-    def async_rebind_device(self, device: Device) -> None:
-        """Repoint this proxy to a replacement device object after a re-interview."""
+    def async_cleanup_handles(self) -> None:
+        """Unsubscribe from device events."""
         for unsub in self._unsubs:
             unsub()
-
         self._unsubs.clear()
 
+    @callback
+    def async_rebind_device(self, device: BaseDevice) -> None:
+        """Repoint this proxy to a replacement device object after a re-interview."""
+        self.async_cleanup_handles()
         self.device = device
         self._unsubs.append(self.device.on_all_events(self._handle_event_protocol))
         self.attach_event_handlers()
@@ -561,11 +565,14 @@ class ZHADeviceProxy(EventBase):
             for route in topology.routes[self.device.ieee]
         ]
 
-        # Return endpoint device type Names
+        # Return endpoint device type Names. Green Power devices have no endpoints.
         names: list[dict[str, str]] = []
-        for endpoint in (
-            ep for epid, ep in self.device.device.endpoints.items() if epid
-        ):
+        endpoints = (
+            self.device.device.endpoints.items()
+            if isinstance(self.device, ZigbeeDevice)
+            else ()
+        )
+        for endpoint in (ep for epid, ep in endpoints if epid):
             profile = PROFILES.get(endpoint.profile_id)
             if profile and endpoint.device_type is not None:
                 # DeviceType provides undefined enums
@@ -873,7 +880,7 @@ class ZHAGatewayProxy(EventBase):
         entity_refs = self._ha_entity_refs.pop(event.device_info.ieee, None)
         if zha_device_proxy is not None:
             device_info = zha_device_proxy.zha_device_info
-            # zha_device_proxy.async_cleanup_handles()
+            zha_device_proxy.async_cleanup_handles()
             async_dispatcher_send(
                 self.hass,
                 f"{SIGNAL_REMOVE_ENTITIES}_{zha_device_proxy.device.ieee!s}",
@@ -1034,6 +1041,9 @@ class ZHAGatewayProxy(EventBase):
         """Shutdown the gateway proxy."""
         for unsub in self._unsubs:
             unsub()
+        self._unsubs.clear()
+        for device_proxy in self.device_proxies.values():
+            device_proxy.async_cleanup_handles()
         await self.gateway.shutdown()
 
     def get_device_proxy(self, ieee: EUI64) -> ZHADeviceProxy | None:
@@ -1079,7 +1089,9 @@ class ZHAGatewayProxy(EventBase):
             e for e in entity_refs if e.ha_entity_id != entity.entity_id
         ]
 
-    def _async_get_or_create_device_proxy(self, zha_device: Device) -> ZHADeviceProxy:
+    def _async_get_or_create_device_proxy(
+        self, zha_device: BaseDevice
+    ) -> ZHADeviceProxy:
         """Get or create a ZHA device."""
         if (zha_device_proxy := self.device_proxies.get(zha_device.ieee)) is None:
             coordinator_ieee = self.gateway.state.node_info.ieee
@@ -1629,6 +1641,9 @@ def async_cluster_exists(hass: HomeAssistant, cluster_id, skip_coordinator=True)
     zha_gateway = get_zha_gateway(hass)
     zha_devices = zha_gateway.devices.values()
     for zha_device in zha_devices:
+        # Green Power devices have no clusters
+        if not isinstance(zha_device, ZigbeeDevice):
+            continue
         if skip_coordinator and zha_device.is_coordinator:
             continue
         clusters_by_endpoint = zha_device.async_get_clusters()
